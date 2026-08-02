@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "war-protocol",
+    "war-server",
+    "war-client",
+]
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+bincode = { version = "2.0.1", features = ["serde"] }
+tokio = { version = "1.53.1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+] }
