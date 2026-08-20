@@ -1,14 +1,17 @@
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExit};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use war_protocol::{MAX_FRAME_SIZE, decode, encode};
 
-pub async fn write_message<W, T>(writer: &mut w, message: &T) -> io::Result<()>
+pub async fn write_message<W, T>(writer: &mut W, message: &T) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
     T: serde::Serialize,
 {
+    let payload =
+        encode(message).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
     if payload.len() > MAX_FRAME_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -43,5 +46,3 @@ where
 
     decode(&payload).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
-
-

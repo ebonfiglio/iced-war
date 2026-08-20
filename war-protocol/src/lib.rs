@@ -146,7 +146,7 @@ pub struct RoundResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     Hello {
-        protocol_version: u16,
+        protocol_version: u32,
         username: String,
     },
 

@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
+
+war-protocol = {
+    path = "../war-protocol"
+}
+
+rand = "0.10.2"
