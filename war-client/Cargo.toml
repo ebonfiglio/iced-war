@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio.workspace = true
+serde.workspace = true
+
+war-protocol = {
+    path = "../war-protocol"
+}
+
+iced = {
+    version = "0.14.0",
+    features = ["tokio"]
+}
