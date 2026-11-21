@@ -1,15 +1,16 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::io;
+
 use tokio::net::{
-    TcpListener,
+    TcpListener, TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio::sync::mpsc;
 mod game;
-mod wire;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use war_protocol::wire;
 use war_protocol::{
     ClientId, ClientMessage, PROTOCOL_VERSION, RoomId, RoomSummary, RoomView, ServerMessage,
 };
@@ -99,8 +100,12 @@ impl Server {
 
 impl Server {
     fn remove_player(&mut self, client_id: ClientId) {
-        self.leave_room(client_id);
-        self.clients.remove(&client_id);
+        if let Some(client) = self.clients.remove(&client_id)
+            && let Some(room_id) = client.room_id
+        {
+            self.remove_from_room(client_id, room_id);
+            self.broadcast_rooms();
+        }
     }
 }
 
@@ -112,24 +117,26 @@ impl Server {
     }
 
     fn leave_room(&mut self, client_id: ClientId) {
-        let room_id = self
+        let Some(room_id) = self
             .clients
-            .get(&client_id)
-            .and_then(|client| client.room_id);
-
-        let Some(room_id) = room_id else {
+            .get_mut(&client_id)
+            .and_then(|client| client.room_id.take())
+        else {
             return;
         };
 
-        let Some(room) = self.rooms.get(&room_id) else {
+        self.remove_from_room(client_id, room_id);
+        self.send(client_id, ServerMessage::LeftRoom);
+        self.broadcast_rooms();
+    }
+
+    fn remove_from_room(&mut self, client_id: ClientId, room_id: RoomId) {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
             return;
         };
 
-        let is_host = room.host == client_id;
-
-        let guest = room.guest;
-
-        if is_host {
+        if room.host == client_id {
+            let guest = room.guest;
             self.rooms.remove(&room_id);
 
             if let Some(guest_id) = guest {
@@ -139,33 +146,49 @@ impl Server {
 
                 self.send(guest_id, ServerMessage::LeftRoom);
             }
-        } else {
-            if let Some(room) = self.rooms.get_mut(&room_id) {
-                room.guest = None;
-                room.game = None;
-            }
-
+        } else if room.guest == Some(client_id) {
+            room.guest = None;
+            room.game = None;
             self.send_room_state(room_id);
         }
-
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            client.room_id = None;
-        }
-
-        self.send(client_id, ServerMessage::LeftRoom);
-
-        self.broadcast_rooms();
     }
 }
 
 impl Server {
+    fn send_error(&self, client_id: ClientId, message: &str) {
+        self.send(
+            client_id,
+            ServerMessage::Error {
+                message: message.into(),
+            },
+        );
+    }
+
     fn handle_message(&mut self, client_id: ClientId, message: ClientMessage) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+
+        if client.username.is_none()
+            && !matches!(
+                message,
+                ClientMessage::Hello { .. } | ClientMessage::Ping { .. }
+            )
+        {
+            self.send_error(client_id, "Log in before joining or playing a game.");
+            return;
+        }
+
         match message {
             ClientMessage::Hello {
                 protocol_version,
                 username,
             } => {
-                self.login(client_id, protocol_version, username);
+                if client.username.is_some() {
+                    self.send_error(client_id, "You are already logged in.");
+                } else {
+                    self.login(client_id, protocol_version, username);
+                }
             }
 
             ClientMessage::RequestRooms => {
@@ -198,26 +221,14 @@ impl Server {
 impl Server {
     fn login(&mut self, client_id: ClientId, version: u32, username: String) {
         if version != PROTOCOL_VERSION {
-            self.send(
-                client_id,
-                ServerMessage::Error {
-                    message: "Protocol version mismatch.".into(),
-                },
-            );
-
+            self.send_error(client_id, "Protocol version mismatch.");
             return;
         }
 
         let username = username.trim().to_string();
 
         if username.is_empty() || username.len() > 20 {
-            self.send(
-                client_id,
-                ServerMessage::Error {
-                    message: "Invalid username.".into(),
-                },
-            );
-
+            self.send_error(client_id, "Invalid username.");
             return;
         }
 
@@ -227,13 +238,7 @@ impl Server {
             .any(|client| client.username.as_deref() == Some(&username));
 
         if already_used {
-            self.send(
-                client_id,
-                ServerMessage::Error {
-                    message: "That username is already in use.".into(),
-                },
-            );
-
+            self.send_error(client_id, "That username is already in use.");
             return;
         }
 
@@ -243,13 +248,14 @@ impl Server {
 
         self.send(client_id, ServerMessage::Welcome { client_id });
 
-        self.broadcast_rooms();
+        self.send_rooms(client_id);
     }
 }
 
 impl Server {
     fn room_summaries(&self) -> Vec<RoomSummary> {
-        self.rooms
+        let mut rooms: Vec<_> = self
+            .rooms
             .values()
             .filter_map(|room| {
                 let host = self.clients.get(&room.host)?;
@@ -266,7 +272,9 @@ impl Server {
                     in_game: room.game.is_some(),
                 })
             })
-            .collect()
+            .collect();
+        rooms.sort_unstable_by_key(|room| room.id);
+        rooms
     }
 }
 
@@ -295,22 +303,12 @@ impl Server {
 
 impl Server {
     fn create_room(&mut self, client_id: ClientId) {
-        let Some(client) = self.clients.get(&client_id) else {
+        let Some(client) = self.clients.get_mut(&client_id) else {
             return;
         };
 
-        if client.username.is_none() {
-            return;
-        }
-
         if client.room_id.is_some() {
-            self.send(
-                client_id,
-                ServerMessage::Error {
-                    message: "Leave your current room first.".into(),
-                },
-            );
-
+            self.send_error(client_id, "Leave your current room first.");
             return;
         }
 
@@ -327,7 +325,7 @@ impl Server {
             },
         );
 
-        self.clients.get_mut(&client_id).unwrap().room_id = Some(room_id);
+        client.room_id = Some(room_id);
 
         self.send_room_state(room_id);
         self.broadcast_rooms();
@@ -375,40 +373,39 @@ impl Server {
         };
 
         if client.room_id.is_some() {
+            self.send_error(client_id, "Leave your current room first.");
             return;
         }
 
-        let Some(room) = self.rooms.get(&room_id) else {
-            self.send(
-                client_id,
-                ServerMessage::Error {
-                    message: "Room does not exist.".into(),
-                },
-            );
-
+        let Some(guest_name) = client.username.clone() else {
+            self.send_error(client_id, "Log in before joining a game.");
             return;
         };
 
-        if room.host == client_id || room.guest.is_some() {
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            self.send_error(client_id, "Room does not exist.");
+            return;
+        };
+
+        if room.guest.is_some() {
+            self.send_error(client_id, "Room is full.");
             return;
         }
 
         let host_id = room.host;
+        let Some(host_name) = self
+            .clients
+            .get(&host_id)
+            .and_then(|host| host.username.clone())
+        else {
+            self.send_error(client_id, "Room host is no longer available.");
+            return;
+        };
 
-        let host_name = self.clients[&host_id].username.clone().unwrap();
-
-        let guest_name = self.clients[&client_id].username.clone().unwrap();
-
-        let game = Game::new(room_id, host_id, host_name, client_id, guest_name);
-
-        {
-            let room = self.rooms.get_mut(&room_id).unwrap();
-
-            room.guest = Some(client_id);
-
-            room.game = Some(game);
-        }
-
+        room.guest = Some(client_id);
+        room.game = Some(Game::new(
+            room_id, host_id, host_name, client_id, guest_name,
+        ));
         self.clients.get_mut(&client_id).unwrap().room_id = Some(room_id);
 
         self.send_room_state(room_id);
@@ -450,15 +447,17 @@ impl Server {
             .get(&client_id)
             .and_then(|client| client.room_id)
         else {
+            self.send_error(client_id, "Join a game before playing a card.");
             return;
         };
 
         let resolution = {
-            let Some(room) = self.rooms.get_mut(&room_id) else {
-                return;
-            };
-
-            let Some(game) = room.game.as_mut() else {
+            let Some(game) = self
+                .rooms
+                .get_mut(&room_id)
+                .and_then(|room| room.game.as_mut())
+            else {
+                self.send_error(client_id, "There is no active game in this room.");
                 return;
             };
 
@@ -510,19 +509,15 @@ impl Server {
 async fn reader_loop(
     client_id: ClientId,
     mut reader: OwnedReadHalf,
-    events: mpsc::UnboundedSender<ServerEvent>,
-) {
+    events: &mpsc::UnboundedSender<ServerEvent>,
+) -> io::Result<()> {
     loop {
-        match wire::read_message::<_, ClientMessage>(&mut reader).await {
-            Ok(message) => {
-                let _ = events.send(ServerEvent::Message { client_id, message });
-            }
-
-            Err(_) => {
-                let _ = events.send(ServerEvent::Disconnected { client_id });
-
-                return;
-            }
+        let message = wire::read_message(&mut reader).await?;
+        if events
+            .send(ServerEvent::Message { client_id, message })
+            .is_err()
+        {
+            return Ok(());
         }
     }
 }
@@ -530,12 +525,41 @@ async fn reader_loop(
 async fn writer_loop(
     mut writer: OwnedWriteHalf,
     mut messages: mpsc::UnboundedReceiver<ServerMessage>,
-) {
+) -> io::Result<()> {
     while let Some(message) = messages.recv().await {
-        if wire::write_message(&mut writer, &message).await.is_err() {
-            return;
-        }
+        wire::write_message(&mut writer, &message).await?;
     }
+    Ok(())
+}
+
+async fn handle_connection(
+    socket: TcpStream,
+    client_id: ClientId,
+    events: mpsc::UnboundedSender<ServerEvent>,
+) {
+    let (reader, writer) = socket.into_split();
+    let (sender, messages) = mpsc::unbounded_channel();
+
+    if events
+        .send(ServerEvent::Connected { client_id, sender })
+        .is_err()
+    {
+        return;
+    }
+
+    let result = tokio::select! {
+        result = reader_loop(client_id, reader, &events) => result,
+        result = writer_loop(writer, messages) => result,
+    };
+
+    if let Err(error) = result
+        && error.kind() != io::ErrorKind::UnexpectedEof
+        && error.kind() != io::ErrorKind::ConnectionReset
+    {
+        eprintln!("Client {client_id} disconnected: {error}");
+    }
+
+    let _ = events.send(ServerEvent::Disconnected { client_id });
 }
 
 async fn accept_loop(
@@ -549,18 +573,7 @@ async fn accept_loop(
 
         println!("Client {client_id} connected: {address}");
 
-        let (reader, writer) = socket.into_split();
-
-        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
-
-        let _ = events.send(ServerEvent::Connected {
-            client_id,
-            sender: outgoing_tx,
-        });
-
-        tokio::spawn(reader_loop(client_id, reader, events.clone()));
-
-        tokio::spawn(writer_loop(writer, outgoing_rx));
+        tokio::spawn(handle_connection(socket, client_id, events.clone()));
     }
 }
 
@@ -570,11 +583,178 @@ async fn main() -> std::io::Result<()> {
 
     println!("WAR server listening on 127.0.0.1:9001");
 
+    serve(listener).await
+}
+
+async fn serve(listener: TcpListener) -> io::Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(accept_loop(listener, event_tx));
+    tokio::select! {
+        result = accept_loop(listener, event_tx) => result,
+        () = Server::new().run(event_rx) => Ok(()),
+    }
+}
 
-    Server::new().run(event_rx).await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
 
-    Ok(())
+    async fn send(stream: &mut TcpStream, message: ClientMessage) {
+        wire::write_message(stream, &message).await.unwrap();
+    }
+
+    async fn receive(stream: &mut TcpStream) -> ServerMessage {
+        wire::read_message(stream).await.unwrap()
+    }
+
+    async fn login(stream: &mut TcpStream, username: &str) {
+        send(
+            stream,
+            ClientMessage::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                username: username.into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receive(stream).await,
+            ServerMessage::Welcome { .. }
+        ));
+        assert!(matches!(
+            receive(stream).await,
+            ServerMessage::RoomList { .. }
+        ));
+    }
+
+    async fn game_state(stream: &mut TcpStream) -> war_protocol::PlayerGameView {
+        match receive(stream).await {
+            ServerMessage::GameState { game } => game,
+            message => panic!("Expected game state, got {message:?}"),
+        }
+    }
+
+    async fn join_game(host: &mut TcpStream, guest: &mut TcpStream, room_id: RoomId) {
+        send(guest, ClientMessage::JoinRoom { room_id }).await;
+        for player in [host, guest] {
+            assert!(matches!(
+                receive(player).await,
+                ServerMessage::RoomState { room } if room.id == room_id && room.guest_name.is_some()
+            ));
+            let game = game_state(player).await;
+            assert_eq!(game.your_cards_remaining, 26);
+            assert_eq!(game.your_score, 0);
+            assert!(matches!(
+                receive(player).await,
+                ServerMessage::RoomList { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn play_full_game_and_recover_from_departures() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(serve(listener));
+
+            let mut host = TcpStream::connect(address).await.unwrap();
+            login(&mut host, "Host").await;
+            send(&mut host, ClientMessage::CreateRoom).await;
+            let room_id = match receive(&mut host).await {
+                ServerMessage::RoomState { room } => room.id,
+                message => panic!("Expected room state, got {message:?}"),
+            };
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::RoomList { .. }
+            ));
+
+            let mut guest = TcpStream::connect(address).await.unwrap();
+            send(&mut guest, ClientMessage::JoinRoom { room_id }).await;
+            assert!(matches!(
+                receive(&mut guest).await,
+                ServerMessage::Error { .. }
+            ));
+            login(&mut guest, "Guest").await;
+            join_game(&mut host, &mut guest, room_id).await;
+
+            for remaining in (0..26).rev() {
+                send(&mut host, ClientMessage::PlayCard).await;
+                let waiting = game_state(&mut host).await;
+                assert!(waiting.you_played);
+                assert_eq!(waiting.your_cards_remaining, remaining);
+                assert!(game_state(&mut guest).await.opponent_played);
+
+                send(&mut guest, ClientMessage::PlayCard).await;
+                for player in [&mut host, &mut guest] {
+                    assert!(matches!(
+                        receive(player).await,
+                        ServerMessage::RoundResult { .. }
+                    ));
+                    let game = game_state(player).await;
+                    assert_eq!(game.your_cards_remaining, remaining);
+                    assert_eq!(game.opponent_cards_remaining, remaining);
+                    assert_eq!(game.finished, remaining == 0);
+                    assert!(!game.you_played && !game.opponent_played);
+                    assert_eq!(
+                        game.your_score + game.opponent_score + game.battle_pot,
+                        52 - 2 * remaining
+                    );
+                    if game.finished {
+                        assert_eq!(game.battle_pot, 0);
+                    }
+                }
+            }
+
+            drop(guest);
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::RoomState { room } if room.id == room_id && room.guest_name.is_none()
+            ));
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::RoomList { rooms }
+                    if rooms.len() == 1 && rooms[0].player_count == 1 && !rooms[0].in_game
+            ));
+
+            let mut guest = TcpStream::connect(address).await.unwrap();
+            login(&mut guest, "Guest").await;
+            join_game(&mut host, &mut guest, room_id).await;
+            send(&mut guest, ClientMessage::LeaveRoom).await;
+            assert!(matches!(
+                receive(&mut host).await,
+                ServerMessage::RoomState { room } if room.guest_name.is_none()
+            ));
+            assert!(matches!(receive(&mut guest).await, ServerMessage::LeftRoom));
+            for player in [&mut host, &mut guest] {
+                assert!(matches!(
+                    receive(player).await,
+                    ServerMessage::RoomList { .. }
+                ));
+            }
+            join_game(&mut host, &mut guest, room_id).await;
+
+            drop(host);
+            assert!(matches!(receive(&mut guest).await, ServerMessage::LeftRoom));
+            assert!(matches!(
+                receive(&mut guest).await,
+                ServerMessage::RoomList { rooms } if rooms.is_empty()
+            ));
+
+            send(&mut guest, ClientMessage::CreateRoom).await;
+            assert!(matches!(
+                receive(&mut guest).await,
+                ServerMessage::RoomState { .. }
+            ));
+            assert!(matches!(
+                receive(&mut guest).await,
+                ServerMessage::RoomList { .. }
+            ));
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        })
+        .await
+        .expect("game traffic stalled");
+    }
 }

@@ -2,7 +2,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use war_protocol::{MAX_FRAME_SIZE, decode, encode};
+use crate::{MAX_FRAME_SIZE, decode, encode};
 
 pub async fn write_message<W, T>(writer: &mut W, message: &T) -> io::Result<()>
 where
@@ -19,11 +19,11 @@ where
         ));
     }
 
-    writer.write_u32(payload.len() as u32).await?;
-
-    writer.write_all(&payload).await?;
-
-    Ok(())
+    let length = (payload.len() as u32).to_be_bytes();
+    let mut frame = Vec::with_capacity(length.len() + payload.len());
+    frame.extend_from_slice(&length);
+    frame.extend_from_slice(&payload);
+    writer.write_all(&frame).await
 }
 
 pub async fn read_message<R, T>(reader: &mut R) -> io::Result<T>

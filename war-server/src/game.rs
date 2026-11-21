@@ -226,9 +226,7 @@ impl Game {
             RoundOutcome::Lose
         };
 
-        let points_awarded_to_you = if resolution.split {
-            resolution.points_awarded
-        } else if resolution.winner == Some(you) {
+        let points_awarded_to_you = if resolution.split || resolution.winner == Some(you) {
             resolution.points_awarded
         } else {
             0
